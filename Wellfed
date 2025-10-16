@@ -1,0 +1,650 @@
+wellfed/
+├─ backend/
+│  ├─ package.json
+│  ├─ .env.example
+│  ├─ Dockerfile
+│  ├─ db.sql
+│  └─ src/
+│     ├─ index.js
+│     ├─ routes/
+│     │  ├─ auth.js
+│     │  ├─ users.js
+│     │  └─ plan.js
+│     └─ lib/
+│        └─ mealPlanner.js
+└─ mobile/
+   ├─ package.json
+   ├─ app.json
+   └─ App.js
+   └─ src/
+      ├─ screens/
+      │  ├─ LoginScreen.js
+      │  ├─ RegisterScreen.js
+      │  ├─ ProfileScreen.js
+      │  └─ PlanScreen.js
+      └─ lib/
+         └─ api.js
+{
+  "name": "wellfed-backend",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "pg": "^8.10.0",
+    "csv-stringify": "^6.0.6"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+PORT=4000
+DATABASE_URL=postgres://postgres:password@localhost:5432/wellfed
+JWT_SECRET=replace_with_a_strong_secret
+FROM node:18-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --only=production
+COPY . .
+ENV NODE_ENV=production
+CMD ["node", "src/index.js"]
+-- users
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  name TEXT,
+  birthdate DATE,
+  sex TEXT,
+  height_cm INTEGER,
+  weight_kg REAL,
+  activity_level TEXT,
+  goal TEXT,
+  income_band TEXT,
+  preferences JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+-- foods
+CREATE TABLE IF NOT EXISTS foods (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  cuisine_tag TEXT,
+  calories INTEGER,
+  protein_g REAL,
+  carbs_g REAL,
+  fat_g REAL,
+  serving TEXT,
+  premium BOOLEAN DEFAULT false,
+  tags TEXT[]
+);
+
+-- saved plans
+CREATE TABLE IF NOT EXISTS saved_plans (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  plan_date DATE DEFAULT CURRENT_DATE,
+  total_calories INTEGER,
+  macros JSONB,
+  plan JSONB,
+  created_at TIMESTAMP DEFAULT now()
+);
+
+-- seed sample foods (small sample; expand later)
+INSERT INTO foods (name,cuisine_tag,calories,protein_g,carbs_g,fat_g,serving,premium,tags) VALUES
+('Oats porridge (1 cup)','neutral',300,10,54,5,'1 cup',false,ARRAY['breakfast']),
+('Boiled eggs (2 pcs)','neutral',156,12,1,11,'2 eggs',false,ARRAY['breakfast','protein']),
+('Grilled tilapia (200g)','Nigerian',350,40,0,20,'200g',true,ARRAY['lunch','protein','fish']),
+('Jollof rice (1.5 cups)','Nigerian',450,8,88,6,'1.5 cups',false,ARRAY['lunch','carb']),
+('Steamed spinach (1 cup)','neutral',40,5,7,0.5,'1 cup',false,ARRAY['side','veg']),
+('Greek yogurt (200g)','neutral',140,12,8,6,'200g',true,ARRAY['snack','protein']),
+('Plantain baked (1 medium)','Nigerian',220,2,58,0.5,'1 medium',false,ARRAY['snack','carb']),
+('Chicken pepper soup (300g)','Nigerian',280,40,5,10,'300g',false,ARRAY['dinner','protein']),
+('Pounded yam (small ball)','Nigerian',360,4,80,1.5,'1 small ball',false,ARRAY['dinner','carb']),
+('Mixed salad with olive oil','neutral',150,3,10,12,'1 bowl',true,ARRAY['side','veg']);
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const planRoutes = require('./routes/plan');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+app.locals.pool = pool;
+
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/plan', planRoutes);
+
+const port = process.env.PORT || 4000;
+app.listen(port, ()=> console.log(`WellFed API listening on ${port}`));
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+
+router.post('/register', async (req, res) => {
+  const pool = req.app.locals.pool;
+  const { email, password, name } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+    const r = await pool.query(
+      `INSERT INTO users (email,password_hash,name) VALUES ($1,$2,$3) RETURNING id,email,name`,
+      [email, hashed, name || null]
+    );
+    const user = r.rows[0];
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Email already used' });
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  const pool = req.app.locals.pool;
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const r = await pool.query('SELECT id,email,password_hash,name FROM users WHERE email=$1', [email]);
+    const user = r.rows[0];
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+module.exports = router;
+const express = require('express');
+const router = express.Router();
+const jwt = require('jsonwebtoken');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Missing token' });
+  const token = auth.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.userId;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+router.get('/me', authMiddleware, async (req, res) => {
+  const pool = req.app.locals.pool;
+  const r = await pool.query('SELECT id,email,name,birthdate,sex,height_cm,weight_kg,activity_level,goal,income_band,preferences FROM users WHERE id=$1', [req.userId]);
+  res.json({ user: r.rows[0] });
+});
+
+router.put('/me', authMiddleware, async (req, res) => {
+  const pool = req.app.locals.pool;
+  const { name, birthdate, sex, height_cm, weight_kg, activity_level, goal, income_band, preferences } = req.body;
+  const r = await pool.query(
+    `UPDATE users SET name=$1,birthdate=$2,sex=$3,height_cm=$4,weight_kg=$5,activity_level=$6,goal=$7,income_band=$8,preferences=$9 WHERE id=$10 RETURNING id,email,name,birthdate,sex,height_cm,weight_kg,activity_level,goal,income_band,preferences`,
+    [name, birthdate, sex, height_cm, weight_kg, activity_level, goal, income_band, preferences || {}, req.userId]
+  );
+  res.json({ user: r.rows[0] });
+});
+
+module.exports = router;
+// mealPlanner.js
+// Exports generatePlan(user, pool)
+
+function computeBMR({ sex, weightKg, heightCm, age }) {
+  if (sex === 'male') return 10*weightKg + 6.25*heightCm - 5*age + 5;
+  return 10*weightKg + 6.25*heightCm - 5*age - 161;
+}
+function activityFactor(level) {
+  switch(level){
+    case 'sedentary': return 1.2;
+    case 'light': return 1.375;
+    case 'moderate': return 1.55;
+    case 'very': return 1.725;
+    default: return 1.55;
+  }
+}
+
+async function fetchCandidates(pool, tags = []) {
+  // Basic query: return foods that include one of the tags
+  if (!tags || tags.length===0) {
+    const r = await pool.query('SELECT * FROM foods ORDER BY premium DESC LIMIT 50');
+    return r.rows;
+  }
+  const r = await pool.query(
+    `SELECT * FROM foods WHERE tags && $1::text[] ORDER BY premium DESC LIMIT 50`,
+    [tags]
+  );
+  return r.rows;
+}
+
+function chooseGreedy(candidates, targetCalories) {
+  const chosen = [];
+  let accum = 0;
+  let i = 0;
+  while (accum < targetCalories && candidates.length>0 && i < candidates.length) {
+    const item = candidates[i % candidates.length];
+    chosen.push(item);
+    accum += item.calories;
+    i++;
+    if (i > 100) break;
+  }
+  return { chosen, cals: accum };
+}
+
+async function generatePlan(user, pool) {
+  // user: fields: age, sex, weightKg, heightCm, activity_level, goal, income_band, preferences
+  const bmr = computeBMR({ sex: user.sex, weightKg: user.weight_kg, heightCm: user.height_cm, age: user.age });
+  const tdee = Math.round(bmr * activityFactor(user.activity_level || 'moderate'));
+  let targetCalories = tdee;
+  if (user.goal === 'mild_loss') targetCalories = Math.max(1200, tdee - 300);
+  if (user.goal === 'loss') targetCalories = Math.max(1200, tdee - 500);
+  if (user.goal === 'gain') targetCalories = tdee + 400;
+
+  const macrosPct = { carbs: 0.5, protein: 0.2, fat: 0.3 };
+  const macrosGrams = {
+    carbs_g: Math.round((targetCalories * macrosPct.carbs)/4),
+    protein_g: Math.round((targetCalories * macrosPct.protein)/4),
+    fat_g: Math.round((targetCalories * macrosPct.fat)/9)
+  };
+
+  const slots = [
+    { name: 'Breakfast', pct: 0.25, tags: ['breakfast'] },
+    { name: 'Lunch', pct: 0.30, tags: ['lunch'] },
+    { name: 'Dinner', pct: 0.30, tags: ['dinner'] },
+    { name: 'Snacks', pct: 0.15, tags: ['snack'] }
+  ];
+
+  const plan = [];
+  let totalCals=0;
+
+  for (const slot of slots) {
+    const slotTarget = Math.round(targetCalories * slot.pct);
+    const candidates = await fetchCandidates(pool, slot.tags);
+    const { chosen, cals } = chooseGreedy(candidates, slotTarget);
+    totalCals += cals;
+    plan.push({
+      slot: slot.name,
+      target_kcal: slotTarget,
+      items: chosen.map(it => ({
+        id: it.id,
+        name: it.name,
+        serving: it.serving,
+        calories: it.calories,
+        protein: it.protein_g,
+        carbs: it.carbs_g,
+        fat: it.fat_g
+      }))
+    });
+  }
+
+  return {
+    summary: { bmr, tdee, targetCalories, macrosGrams },
+    totals: { calories: totalCals },
+    plan
+  };
+}
+
+module.exports = { generatePlan };
+const express = require('express');
+const router = express.Router();
+const jwt = require('jsonwebtoken');
+const { generatePlan } = require('../lib/mealPlanner');
+const { stringify } = require('csv-stringify/sync');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Missing token' });
+  const token = auth.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.userId;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// generate plan (on-the-fly)
+router.post('/generate', authMiddleware, async (req, res) => {
+  const pool = req.app.locals.pool;
+  // fetch user details to pass to planner if not provided
+  const userId = req.userId;
+  const r = await pool.query('SELECT id,email,name,birthdate,sex,height_cm,weight_kg,activity_level,goal,income_band,preferences FROM users WHERE id=$1',[userId]);
+  const user = r.rows[0];
+  // compute age
+  let age = null;
+  if (user.birthdate) {
+    const diff = new Date() - new Date(user.birthdate);
+    age = Math.floor(diff / (365.25*24*3600*1000));
+  } else age = req.body.age || 30;
+  const plannerUser = {
+    age,
+    sex: user.sex || req.body.sex || 'male',
+    height_cm: user.height_cm || req.body.height_cm,
+    weight_kg: user.weight_kg || req.body.weight_kg,
+    activity_level: user.activity_level || req.body.activity_level || 'moderate',
+    goal: user.goal || req.body.goal || 'maintain',
+    income_band: user.income_band || req.body.income_band || '>=5M',
+    preferences: user.preferences || req.body.preferences || {}
+  };
+
+  const plan = await generatePlan(plannerUser, pool);
+  res.json(plan);
+});
+
+// save plan
+router.post('/save', authMiddleware, async (req, res) => {
+  const pool = req.app.locals.pool;
+  const { plan, total_calories, macros } = req.body;
+  const r = await pool.query(
+    `INSERT INTO saved_plans (user_id, total_calories, macros, plan) VALUES ($1,$2,$3,$4) RETURNING id,plan,created_at`,
+    [req.userId, total_calories || 0, macros || {}, plan]
+  );
+  res.json({ saved: r.rows[0] });
+});
+
+// list saved
+router.get('/saved', authMiddleware, async (req, res) => {
+  const pool = req.app.locals.pool;
+  const r = await pool.query('SELECT id,plan_date,total_calories,macros,plan,created_at FROM saved_plans WHERE user_id=$1 ORDER BY created_at DESC',[req.userId]);
+  res.json({ saved: r.rows });
+});
+
+// export shopping list (CSV) — naive list: flatten food names from plan
+router.post('/export/shopping', authMiddleware, async (req, res) => {
+  const { plan } = req.body;
+  if (!plan) return res.status(400).json({ error: 'Missing plan' });
+  // collect items
+  const rows = [];
+  for (const slot of plan) {
+    for (const item of slot.items) {
+      rows.push({slot: slot.slot, item: item.name, serving: item.serving});
+    }
+  }
+  const csv = stringify(rows, { header: true, columns: ['slot','item','serving'] });
+  res.setHeader('Content-disposition', 'attachment; filename=shopping.csv');
+  res.set('Content-Type', 'text/csv');
+  res.send(csv);
+});
+
+module.exports = router;
+{
+  "name": "WellFedApp",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
+  },
+  "dependencies": {
+    "expo": "~49.0.0",
+    "expo-status-bar": "~1.4.4",
+    "react": "18.2.0",
+    "react-native": "0.72.4",
+    "@react-navigation/native": "^6.1.6",
+    "@react-navigation/native-stack": "^6.9.12",
+    "expo-linking": "~5.0.0"
+  }
+}
+{
+  "expo": {
+    "name": "WellFed",
+    "slug": "wellfed",
+    "platforms": ["ios","android","web"],
+    "version": "1.0.0"
+  }
+}
+import React from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import LoginScreen from './src/screens/LoginScreen';
+import RegisterScreen from './src/screens/RegisterScreen';
+import ProfileScreen from './src/screens/ProfileScreen';
+import PlanScreen from './src/screens/PlanScreen';
+
+const Stack = createNativeStackNavigator();
+
+export default function App(){
+  return (
+    <NavigationContainer>
+      <Stack.Navigator initialRouteName="Login">
+        <Stack.Screen name="Login" component={LoginScreen} />
+        <Stack.Screen name="Register" component={RegisterScreen} />
+        <Stack.Screen name="Profile" component={ProfileScreen} />
+        <Stack.Screen name="Plan" component={PlanScreen} />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+const API_BASE = 'http://<BACKEND_HOST>:4000/api'; // replace <BACKEND_HOST> with your machine IP or ngrok URL
+
+async function post(path, body, token){
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+async function get(path, token){
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { ...(token? { Authorization: `Bearer ${token}` } : {}) }
+  });
+  return res.json();
+}
+
+export default { post, get };
+import React, { useState } from 'react';
+import { View, TextInput, Button, Text, SafeAreaView } from 'react-native';
+import api from '../lib/api';
+
+export default function LoginScreen({ navigation }) {
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  const [msg,setMsg]=useState('');
+
+  async function login(){
+    try{
+      const res = await api.post('/auth/login', { email, password });
+      if (res.token) {
+        // store token temporarily by passing in nav params (simple demo)
+        navigation.navigate('Profile', { token: res.token });
+      } else {
+        setMsg(res.error || 'Login failed');
+      }
+    }catch(e){
+      setMsg('Network error');
+    }
+  }
+
+  return (
+    <SafeAreaView style={{flex:1, padding:20}}>
+      <Text style={{fontSize:22, marginBottom:8}}>WellFed — Login</Text>
+      <TextInput placeholder="Email" value={email} onChangeText={setEmail} autoCapitalize="none" style={{borderWidth:1, padding:8, marginBottom:8}} />
+      <TextInput placeholder="Password" value={password} onChangeText={setPassword} secureTextEntry style={{borderWidth:1, padding:8, marginBottom:8}} />
+      <Button title="Login" onPress={login} />
+      <View style={{height:8}} />
+      <Button title="Register" onPress={() => navigation.navigate('Register')} />
+      <Text style={{color:'red', marginTop:12}}>{msg}</Text>
+    </SafeAreaView>
+  );
+}
+import React, { useState } from 'react';
+import { View, TextInput, Button, Text, SafeAreaView } from 'react-native';
+import api from '../lib/api';
+
+export default function RegisterScreen({ navigation }) {
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  const [name,setName]=useState('');
+  const [msg,setMsg]=useState('');
+
+  async function register(){
+    const res = await api.post('/auth/register', { email, password, name });
+    if (res.token) {
+      navigation.navigate('Profile', { token: res.token });
+    } else {
+      setMsg(res.error || 'Register failed');
+    }
+  }
+
+  return (
+    <SafeAreaView style={{flex:1, padding:20}}>
+      <Text style={{fontSize:22, marginBottom:8}}>WellFed — Register</Text>
+      <TextInput placeholder="Full name" value={name} onChangeText={setName} style={{borderWidth:1, padding:8, marginBottom:8}} />
+      <TextInput placeholder="Email" value={email} onChangeText={setEmail} autoCapitalize="none" style={{borderWidth:1, padding:8, marginBottom:8}} />
+      <TextInput placeholder="Password" value={password} onChangeText={setPassword} secureTextEntry style={{borderWidth:1, padding:8, marginBottom:8}} />
+      <Button title="Register" onPress={register} />
+      <Text style={{color:'red', marginTop:12}}>{msg}</Text>
+    </SafeAreaView>
+  );
+}
+import React, { useEffect, useState } from 'react';
+import { View, TextInput, Button, Text, SafeAreaView } from 'react-native';
+import api from '../lib/api';
+
+export default function ProfileScreen({ navigation, route }) {
+  const token = route.params?.token;
+  const [user,setUser] = useState({});
+  const [loading,setLoading] = useState(true);
+
+  useEffect(()=>{
+    (async ()=>{
+      const r = await api.get('/users/me', token);
+      if (r.user) setUser(r.user);
+      setLoading(false);
+    })();
+  },[]);
+
+  async function save() {
+    const payload = {
+      name: user.name,
+      birthdate: user.birthdate,
+      sex: user.sex,
+      height_cm: user.height_cm,
+      weight_kg: user.weight_kg,
+      activity_level: user.activity_level || 'moderate',
+      goal: user.goal || 'maintain',
+      income_band: user.income_band || '>=5M'
+    };
+    const r = await api.post('/users/me', payload, token);
+    if (r.user) {
+      navigation.navigate('Plan', { token });
+    }
+  }
+
+  if (loading) return <SafeAreaView><Text>Loading...</Text></SafeAreaView>;
+
+  return (
+    <SafeAreaView style={{flex:1, padding:20}}>
+      <Text style={{fontSize:20}}>Profile</Text>
+      <TextInput placeholder="Name" value={user.name||''} onChangeText={t=>setUser({...user, name:t})} style={{borderWidth:1, padding:8, marginBottom:8}}/>
+      <TextInput placeholder="Birthdate (YYYY-MM-DD)" value={user.birthdate||''} onChangeText={t=>setUser({...user, birthdate:t})} style={{borderWidth:1, padding:8, marginBottom:8}}/>
+      <TextInput placeholder="Sex" value={user.sex||''} onChangeText={t=>setUser({...user, sex:t})} style={{borderWidth:1, padding:8, marginBottom:8}}/>
+      <TextInput placeholder="Height cm" value={user.height_cm ? String(user.height_cm) : ''} onChangeText={t=>setUser({...user, height_cm: parseInt(t||0)})} style={{borderWidth:1, padding:8, marginBottom:8}}/>
+      <TextInput placeholder="Weight kg" value={user.weight_kg ? String(user.weight_kg) : ''} onChangeText={t=>setUser({...user, weight_kg: parseFloat(t||0)})} style={{borderWidth:1, padding:8, marginBottom:8}}/>
+      <Button title="Save & Generate Plan" onPress={save} />
+    </SafeAreaView>
+  );
+}
+import React, { useEffect, useState } from 'react';
+import { View, Button, Text, SafeAreaView, ScrollView } from 'react-native';
+import api from '../lib/api';
+
+export default function PlanScreen({ navigation, route }) {
+  const token = route.params?.token;
+  const [plan, setPlan] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  async function generate(){
+    setLoading(true);
+    const res = await api.post('/plan/generate', {}, token);
+    if (res.plan) setPlan(res);
+    else setPlan(res);
+    setLoading(false);
+  }
+
+  useEffect(()=>{ generate(); },[]);
+
+  async function savePlan(){
+    if (!plan) return;
+    const r = await api.post('/plan/save', { plan: plan.plan, total_calories: plan.totals?.calories || 0, macros: plan.summary.macrosGrams }, token);
+    alert('Plan saved');
+  }
+
+  async function exportShopping(){
+    if (!plan) return;
+    // ask backend for CSV
+    const resp = await fetch(`http://<BACKEND_HOST>:4000/api/plan/export/shopping`, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ plan: plan.plan })
+    });
+    const csv = await resp.text();
+    // For demo: show as alert (mobile can implement share or download)
+    alert('CSV:\n' + csv.slice(0,400) + (csv.length>400?'\n...':''));
+  }
+
+  return (
+    <SafeAreaView style={{flex:1, padding:12}}>
+      <Text style={{fontSize:22}}>Your Daily Plan</Text>
+      <Button title={loading ? 'Generating...' : 'Regenerate'} onPress={generate} />
+      <ScrollView style={{marginTop:12}}>
+        {plan && plan.plan && plan.plan.map((slot, idx) => (
+          <View key={idx} style={{borderWidth:1, padding:8, marginBottom:8}}>
+            <Text style={{fontWeight:'bold'}}>{slot.slot} — target {slot.target_kcal} kcal</Text>
+            {slot.items.map((it, i) => (
+              <Text key={i}>{it.name} — {it.serving} — {it.calories} kcal</Text>
+            ))}
+          </View>
+        ))}
+      </ScrollView>
+      <Button title="Save Plan" onPress={savePlan} />
+      <View style={{height:8}} />
+      <Button title="Export Shopping List (CSV)" onPress={exportShopping} />
+    </SafeAreaView>
+  );
+}
+createdb wellfed
+psql -d wellfed -f db.sql
+docker run --name wf-postgres -e POSTGRES_PASSWORD=pass -p 5432:5432 -d postgres
+createdb -h localhost -U postgres wellfed
+psql -h localhost -U postgres -d wellfed -f db.sql
+cd wellfed/backend
+cp .env.example .env
+# edit .env to set DATABASE_URL and JWT_SECRET
+npm install
+npm run dev
+cd wellfed/mobile
+npm install
+# edit src/lib/api.js -> replace <BACKEND_HOST> with your machine IP (e.g. 192.168.1.12) or ngrok URL
+npm start
